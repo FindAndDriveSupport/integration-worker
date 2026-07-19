@@ -2,7 +2,13 @@ name = "integration-worker"
 main = "worker.js"
 compatibility_date = "2024-01-01"
 compatibility_flags = ["nodejs_compat"]
-tail_consumers = [{ service = "alert-worker" }]
+# NOTE: tail_consumers → alert-worker removed for now. Deploy failed with
+# "You must have a subscription to the Workers Paid plan to use Tail
+# Workers" (code 100150), despite leads-api deploying successfully with
+# this exact line many times before — worth checking the account's actual
+# plan/billing status when there's time, since this means NO Worker in
+# this rebuild currently has automated error alerting. Re-add
+# `tail_consumers = [{ service = "alert-worker" }]` once resolved.
 
 [[kv_namespaces]]
 binding = "LEADS_SYNC_CACHE"
