@@ -1,0 +1,38 @@
+name = "integration-worker"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+compatibility_flags = ["nodejs_compat"]
+tail_consumers = [{ service = "alert-worker" }]
+
+[[kv_namespaces]]
+binding = "LEADS_SYNC_CACHE"
+id = "5bdb23b812e54e0fbd9b70dfa25cd5db"
+
+[[kv_namespaces]]
+binding = "VMG_AUTH_CACHE"
+id = "16c54f9e62cd4127a58c47ff09e775a6"
+
+# Main consumer. No max_concurrency cap — unlike the old combined
+# leads-sync-queue, this Worker has no shared mutable state to race on
+# (email digest, the thing that DID need max_concurrency: 1, now lives
+# entirely in digest-worker). Safe to let Cloudflare scale this up under
+# load for faster throughput.
+[[queues.consumers]]
+queue = "integration-queue"
+max_batch_size = 10
+max_batch_timeout = 30
+max_retries = 3
+dead_letter_queue = "integration-dlq"
+
+# Dead-letter consumer — backstop alerting for anything that lands here.
+# Keep max_retries in sync with MAX_QUEUE_RETRIES in worker.js.
+[[queues.consumers]]
+queue = "integration-dlq"
+max_batch_size = 10
+max_retries = 3
+
+[observability.logs]
+enabled = true
+invocation_logs = true
+head_sampling_rate = 0.2
+
