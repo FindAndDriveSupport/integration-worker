@@ -1,12 +1,29 @@
 /**
  * integration-worker — Cloudflare Worker
  *
- * Consumes `integration-queue`. Each message is exactly one (lead,
- * destination) pair for a CRM push — HubSpot, CMS, or VMG, routed by
- * dest.type. This is the ONLY thing this Worker does: no dispatching, no
- * dedup decisions, no fetching from Seriti. It receives fully-resolved
- * messages (destination credentials already merged with shared credentials
- * upstream) and either successfully delivers or lets the queue retry.
+ * Called via Service Binding from queue-worker (POST /deliver) — one call
+ * per (lead, destination) pair for a CRM push, HubSpot/CMS/VMG, routed by
+ * dest.type. No dispatching, no dedup decisions, no fetching from Seriti.
+ * It receives fully-resolved calls (destination credentials already merged
+ * with shared credentials upstream in cron-worker) and either successfully
+ * delivers or returns an error for the caller to handle.
+ *
+ * ─────────────────────────────────────────────────────────────────────────
+ * NO LONGER A QUEUE CONSUMER — converted to a Service Binding target
+ * ─────────────────────────────────────────────────────────────────────────
+ * Originally consumed integration-queue. Converted because Cloudflare
+ * Queues costs ~3 operations per message with a 10k/day budget on the
+ * free plan — per-lead traffic through queues at every hand-off in this
+ * pipeline blew well past that. Service Binding calls are billed as
+ * ordinary Workers requests instead. See cron-worker's file header
+ * "QUEUES OPERATIONS BUDGET" note for the full numbers and reasoning.
+ *
+ * RETRY IS NO LONGER AUTOMATIC: a queue gave failed messages automatic
+ * retry with backoff. Now, if this Worker returns a non-2xx response,
+ * queue-worker just logs it and moves on — the actual retry happens at
+ * cron-worker's level, on its next dispatch tick (up to 30 min later),
+ * since a failure here means cron-worker's lead-level dedup marker never
+ * gets written for that lead.
  *
  * ─────────────────────────────────────────────────────────────────────────
  * WHY THIS IS SEPARATE FROM digest-worker
@@ -15,15 +32,14 @@
  * delivery queue SOLELY because the email digest destination accumulated
  * into a single shared KV key via read-modify-write, which isn't safe under
  * concurrent invocations. Now that email digest lives entirely in its own
- * Worker with its own queue, THIS Worker has no shared mutable state at all
- * — every message here is independent (create one contact, submit one
- * lead). max_concurrency is deliberately left at Cloudflare's default so it
- * can scale up under load for faster overall throughput, unlike before.
+ * Worker with its own accumulation logic, THIS Worker has no shared mutable
+ * state at all — every call here is independent (create one contact,
+ * submit one lead).
  *
  * ─────────────────────────────────────────────────────────────────────────
- * MESSAGE SHAPE (produced by queue-worker)
+ * CALL CONTRACT — POST /deliver (from queue-worker)
  * ─────────────────────────────────────────────────────────────────────────
- * { dealerKey, branchCode, intent, dest, lead, approvalChance, cacheKey }
+ * Body: { dealerKey, branchCode, intent, dest, lead, approvalChance, cacheKey }
  * — dest is one of { type: "hubspot", hubspotToken } |
  *                   { type: "cms", cmsToken, dealerRef, dealerFloorNew,
  *                     dealerFloorUsed, source, ... } |
@@ -32,68 +48,40 @@
  *   the upstream dedup check (in queue-worker) never re-sends this same
  *   lead-destination pair again. This Worker OWNS marking success — nothing
  *   upstream does it, since only this Worker actually knows the send
- *   succeeded.
+ *   succeeded. Returns 200 on success, non-2xx on failure (caller does not
+ *   retry automatically — see note above).
  *
  * REQUIRED wrangler.toml:
  *   [[kv_namespaces]] binding = "LEADS_SYNC_CACHE"  (mark done on success)
  *   [[kv_namespaces]] binding = "VMG_AUTH_CACHE"    (VMG token cache)
- *   [[queues.consumers]] queue = "integration-queue"
- *     max_batch_size = 10, max_retries = 3, dead_letter_queue = "integration-dlq"
- *   [[queues.consumers]] queue = "integration-dlq"
- *     max_batch_size = 10, max_retries = 3
- *   tail_consumers = [{ service = "alert-worker" }]
  */
 
 const DONE_MARKER_TTL = 604800; // 7 days — matches the dedup cache's existing TTL scheme.
-const MAX_QUEUE_RETRIES = 3;    // keep in sync with integration-queue's max_retries in wrangler.toml.
 
 export default {
-  async fetch(request) {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+
+    if (url.pathname === "/deliver" && request.method === "POST") {
+      let body;
+      try {
+        body = await request.json();
+        await processIntegrationMessage(body, env);
+        return new Response("OK", { status: 200 });
+      } catch (err) {
+        const { dealerKey, branchCode, dest, lead, cacheKey } = body || {};
+        const label = branchCode ? `${dealerKey} [${branchCode}]` : dealerKey;
+        console.error(`❌ [integration] Delivery failed for ${label} → ${dest?.type}: ${err.message}. Lead: ${lead?.firstName} ${lead?.lastName} (${lead?.mobileNumber}). Cache key: ${cacheKey}.`);
+        return new Response(JSON.stringify({ error: err.message }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+    }
+
     return new Response("integration-worker", { status: 200 });
   },
-
-  async queue(batch, env, ctx) {
-    if (batch.queue === "integration-dlq") {
-      return handleDeadLetterBatch(batch);
-    }
-    return handleIntegrationBatch(batch, env);
-  },
 };
-
-async function handleIntegrationBatch(batch, env) {
-  for (const message of batch.messages) {
-    try {
-      await processIntegrationMessage(message.body, env);
-      message.ack();
-    } catch (err) {
-      const { dealerKey, branchCode, dest, lead, cacheKey } = message.body;
-      const label = branchCode ? `${dealerKey} [${branchCode}]` : dealerKey;
-      const isFinalAttempt = message.attempts > MAX_QUEUE_RETRIES;
-
-      if (isFinalAttempt) {
-        console.error(
-          `❌ [DEAD LETTER] ${label} → ${dest.type} permanently failed after ${message.attempts} attempts. ` +
-          `Lead: ${lead.firstName} ${lead.lastName} (${lead.mobileNumber}). Cache key: ${cacheKey}. Reason: ${err.message}`
-        );
-      } else {
-        console.log(`⚠️  [integration] Attempt ${message.attempts} failed for ${cacheKey}, will retry: ${err.message}`);
-      }
-      message.retry();
-    }
-  }
-}
-
-async function handleDeadLetterBatch(batch) {
-  for (const message of batch.messages) {
-    const { dealerKey, branchCode, intent, dest, lead, cacheKey } = message.body;
-    const label = branchCode ? `${dealerKey} [${branchCode}]` : dealerKey;
-    console.error(
-      `❌ [DEAD LETTER QUEUE] ${label} → ${dest.type} landed in DLQ. ` +
-      `Lead: ${lead.firstName} ${lead.lastName} (${lead.mobileNumber}), intent: ${intent}. Cache key: ${cacheKey}. Needs manual review.`
-    );
-    message.ack(); // don't let DLQ messages retry indefinitely
-  }
-}
 
 async function processIntegrationMessage(msg, env) {
   const { dest, lead, intent, approvalChance, cacheKey } = msg;
