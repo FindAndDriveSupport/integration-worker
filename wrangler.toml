@@ -2,13 +2,7 @@ name = "integration-worker"
 main = "worker.js"
 compatibility_date = "2024-01-01"
 compatibility_flags = ["nodejs_compat"]
-# NOTE: tail_consumers → alert-worker removed for now. Deploy failed with
-# "You must have a subscription to the Workers Paid plan to use Tail
-# Workers" (code 100150), despite leads-api deploying successfully with
-# this exact line many times before — worth checking the account's actual
-# plan/billing status when there's time, since this means NO Worker in
-# this rebuild currently has automated error alerting. Re-add
-# `tail_consumers = [{ service = "alert-worker" }]` once resolved.
+tail_consumers = [{ service = "alert-worker" }]
 
 [[kv_namespaces]]
 binding = "LEADS_SYNC_CACHE"
@@ -18,27 +12,7 @@ id = "5bdb23b812e54e0fbd9b70dfa25cd5db"
 binding = "VMG_AUTH_CACHE"
 id = "16c54f9e62cd4127a58c47ff09e775a6"
 
-# Main consumer. No max_concurrency cap — unlike the old combined
-# leads-sync-queue, this Worker has no shared mutable state to race on
-# (email digest, the thing that DID need max_concurrency: 1, now lives
-# entirely in digest-worker). Safe to let Cloudflare scale this up under
-# load for faster throughput.
-[[queues.consumers]]
-queue = "integration-queue"
-max_batch_size = 10
-max_batch_timeout = 30
-max_retries = 3
-dead_letter_queue = "integration-dlq"
-
-# Dead-letter consumer — backstop alerting for anything that lands here.
-# Keep max_retries in sync with MAX_QUEUE_RETRIES in worker.js.
-[[queues.consumers]]
-queue = "integration-dlq"
-max_batch_size = 10
-max_retries = 3
-
 [observability.logs]
 enabled = true
 invocation_logs = true
 head_sampling_rate = 0.2
-
