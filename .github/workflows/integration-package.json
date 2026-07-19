@@ -1,0 +1,11 @@
+{
+  "name": "integration-worker",
+  "version": "1.0.0",
+  "description": "Delivers leads to HubSpot, CMS, and VMG based on destination type — part of the leads pipeline (see leads-api's original architecture notes).",
+  "type": "module",
+  "main": "worker.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {}
+}
