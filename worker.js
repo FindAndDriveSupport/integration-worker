@@ -2,11 +2,11 @@
  * integration-worker — Cloudflare Worker
  *
  * Called via Service Binding from queue-worker (POST /deliver) — one call
- * per (lead, destination) pair for a CRM push, HubSpot/CMS/VMG, routed by
- * dest.type. No dispatching, no dedup decisions, no fetching from Seriti.
- * It receives fully-resolved calls (destination credentials already merged
- * with shared credentials upstream in cron-worker) and either successfully
- * delivers or returns an error for the caller to handle.
+ * per (lead, destination) pair for a CRM push, HubSpot/CMS/VMG/DealerOS,
+ * routed by dest.type. No dispatching, no dedup decisions, no fetching
+ * from Seriti. It receives fully-resolved calls (destination credentials
+ * already merged with shared credentials upstream in cron-worker) and
+ * either successfully delivers or returns an error for the caller to handle.
  *
  * ─────────────────────────────────────────────────────────────────────────
  * NO LONGER A QUEUE CONSUMER — converted to a Service Binding target
@@ -43,13 +43,28 @@
  * — dest is one of { type: "hubspot", hubspotToken } |
  *                   { type: "cms", cmsToken, dealerRef, dealerFloorNew,
  *                     dealerFloorUsed, source, ... } |
- *                   { type: "vmg", vmgUsername, vmgPassword, dealerId, ... }
+ *                   { type: "vmg", vmgUsername, vmgPassword, dealerId, ... } |
+ *                   { type: "dealeros", dealerosToken, dealershipId,
+ *                     leadSource, enquiryMethod, ... }
  * — cacheKey is written to LEADS_SYNC_CACHE with value "1" on success, so
  *   the upstream dedup check (in queue-worker) never re-sends this same
  *   lead-destination pair again. This Worker OWNS marking success — nothing
  *   upstream does it, since only this Worker actually knows the send
  *   succeeded. Returns 200 on success, non-2xx on failure (caller does not
  *   retry automatically — see note above).
+ *
+ * ─────────────────────────────────────────────────────────────────────────
+ * DEALEROS NOTES
+ * ─────────────────────────────────────────────────────────────────────────
+ * /api/lead/create requires vehicle_specifications.{year,make,model,new_used}
+ * ALL FOUR together, OR lead.stock_number — we never have stock_number, so
+ * vehicle_specifications is only sent when we have make+model. year is
+ * resolved via resolveVehicleYear(): uses lead.vehicleYear if Seriti ever
+ * supplies it, otherwise defaults to the current year for NEW and
+ * (current year - 2) for USED, since Seriti/CMS leads carry condition but
+ * not model year. dest.leadSource/dest.enquiryMethod must be valid DealerOS
+ * enum values (see their docs) — invalid values 422 rather than failing
+ * silently, and that will surface as a normal thrown error/log line below.
  *
  * REQUIRED wrangler.toml:
  *   [[kv_namespaces]] binding = "LEADS_SYNC_CACHE"  (mark done on success)
@@ -96,8 +111,11 @@ async function processIntegrationMessage(msg, env) {
     case "vmg":
       await sendToVMG(lead, intent, approvalChance, dest, env);
       break;
+    case "dealeros":
+      await sendToDealerOS(lead, intent, approvalChance, dest);
+      break;
     default:
-      throw new Error(`Unknown destination type: ${dest.type} — this Worker only handles hubspot/cms/vmg. Email digest lives in digest-worker.`);
+      throw new Error(`Unknown destination type: ${dest.type} — this Worker only handles hubspot/cms/vmg/dealeros. Email digest lives in digest-worker.`);
   }
 
   await env.LEADS_SYNC_CACHE.put(cacheKey, "1", { expirationTtl: DONE_MARKER_TTL });
@@ -361,4 +379,71 @@ async function sendToVMG(lead, intent, approvalChance, dest, env) {
 
   console.log(`  ✅ [vmg] Lead submitted for dealer ${dest.dealerId}`);
   return res.json().catch(() => ({}));
+}
+
+// ─── DealerOS ─────────────────────────────────────────────────────────────────
+// year defaulting: Seriti/CMS leads carry vehicleCondition but never a
+// model year. If lead.vehicleYear is ever populated upstream, it wins.
+// Otherwise: explicit USED gets (current year - 2) as a stand-in for
+// "near-new" dealer stock. Everything else — explicit NEW, or a skipped
+// vehicle-selection page where vehicleCondition is empty/undefined —
+// defaults to the current year. This is deliberate: a skipped condition
+// is NOT the same signal as a confirmed used vehicle, so it shouldn't
+// silently inherit the used-vehicle offset.
+function resolveVehicleYear(lead) {
+  if (lead.vehicleYear) return String(lead.vehicleYear);
+  const currentYear = new Date().getFullYear();
+  const isUsed = String(lead.vehicleCondition || "").trim().toUpperCase() === "USED";
+  return String(isUsed ? currentYear - 2 : currentYear);
+}
+
+async function sendToDealerOS(lead, intent, approvalChance, dest) {
+  const endpoint = dest.endpoint || "https://api.dealeros.click/api/lead/create";
+  const uniqueId = lead.idNumber || lead.mobileNumber || "unknown";
+
+  const payload = {
+    customer: {
+      first_name: lead.firstName,
+      last_name: lead.lastName || undefined,
+      email: lead.emailAddress || undefined,
+      cell_number: lead.mobileNumber || undefined,
+      national_id_number: lead.idNumber || undefined,
+    },
+    lead: {
+      source: dest.leadSource || "DEALER_WEBSITE_ORGANIC",
+      enquiry_method: dest.enquiryMethod || "WEBSITE",
+      message: `Lead intent: ${intent === "highIntent" ? "High Intent" : "Low Intent"}. Credit grading: ${mapApprovalChanceToCreditGrading(lead.approvalChance)}`,
+      dealership_id: dest.dealershipId,
+      external_reference: `${uniqueId}-${lead.date}`, // lets DealerOS dedupe on retry, if they honour it
+    },
+  };
+
+  // vehicle_specifications requires year+make+model+new_used TOGETHER, or
+  // lead.stock_number (which we never have). Only attach it when we have
+  // make+model to work with — year is always resolvable via the default.
+  if (lead.vehicleMake && lead.vehicleModel) {
+    payload.vehicle_specifications = {
+      year: resolveVehicleYear(lead),
+      make: lead.vehicleMake,
+      model: lead.vehicleModel,
+      new_used: String(lead.vehicleCondition || "").trim().toUpperCase() === "NEW" ? "NEW" : "USED",
+    };
+  }
+
+  const res = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${dest.dealerosToken}`,
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(`DealerOS lead creation failed: ${res.status} — ${JSON.stringify(data)}`);
+  }
+
+  console.log(`  ✅ [dealeros] Lead created for dealership ${dest.dealershipId}`);
+  return data;
 }
