@@ -397,6 +397,22 @@ function resolveVehicleYear(lead) {
   return String(isUsed ? currentYear - 2 : currentYear);
 }
 
+// DealerOS has no dedicated finance/approval-amount field anywhere in its
+// schema (customer/lead/vehicle_specifications) — same situation as lead
+// intent and credit grading, so it's folded into lead.message (max 1000
+// chars) rather than dropped. Only appended when present, since not every
+// lead in the pipeline has an estimatedAmount from Seriti.
+function buildDealerOSMessage(lead, intent) {
+  const parts = [
+    `Lead intent: ${intent === "highIntent" ? "High Intent" : "Low Intent"}`,
+    `Credit grading: ${mapApprovalChanceToCreditGrading(lead.approvalChance)}`,
+  ];
+  if (lead.estimatedAmount) {
+    parts.push(`Estimated approval amount: R${lead.estimatedAmount}`);
+  }
+  return parts.join(". ");
+}
+
 async function sendToDealerOS(lead, intent, approvalChance, dest) {
   const endpoint = dest.endpoint || "https://api.dealeros.click/api/lead/create";
   const uniqueId = lead.idNumber || lead.mobileNumber || "unknown";
@@ -412,7 +428,7 @@ async function sendToDealerOS(lead, intent, approvalChance, dest) {
     lead: {
       source: dest.leadSource || "DEALER_WEBSITE_ORGANIC",
       enquiry_method: dest.enquiryMethod || "WEBSITE",
-      message: `Lead intent: ${intent === "highIntent" ? "High Intent" : "Low Intent"}. Credit grading: ${mapApprovalChanceToCreditGrading(lead.approvalChance)}`,
+      message: buildDealerOSMessage(lead, intent),
       dealership_id: dest.dealershipId,
       external_reference: `${uniqueId}-${lead.date}`, // lets DealerOS dedupe on retry, if they honour it
     },
