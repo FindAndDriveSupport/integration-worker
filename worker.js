@@ -53,6 +53,15 @@
  *   succeeded. Returns 200 on success, non-2xx on failure (caller does not
  *   retry automatically — see note above).
  *
+ * — Response body on success: { ok: true, externalLeadId }, where
+ *   externalLeadId is the CRM-assigned ID for the created contact/lead
+ *   (HubSpot contact id, CMS leadReference, DealerOS lead_id, VMG's
+ *   equivalent — null if the destination didn't return one, or for "email"
+ *   which digest-worker handles, not this Worker).
+ * — externalLeadId is also stored in LEADS_SYNC_CACHE under
+ *   `${cacheKey}-external-id` (7-day TTL, same as the done marker) so it
+ *   can be looked up later without digging through logs.
+ *
  * ─────────────────────────────────────────────────────────────────────────
  * DEALEROS NOTES
  * ─────────────────────────────────────────────────────────────────────────
@@ -65,6 +74,16 @@
  * not model year. dest.leadSource/dest.enquiryMethod must be valid DealerOS
  * enum values (see their docs) — invalid values 422 rather than failing
  * silently, and that will surface as a normal thrown error/log line below.
+ * On success, DealerOS returns { status, success, data: { lead_id } } —
+ * lead_id is pulled out as externalLeadId.
+ *
+ * ─────────────────────────────────────────────────────────────────────────
+ * VMG NOTE
+ * ─────────────────────────────────────────────────────────────────────────
+ * externalLeadId for VMG is a best-effort guess (data.lead_id ?? data.id)
+ * since their success response shape wasn't confirmed against real docs
+ * at the time this was written — confirm against a live response and
+ * adjust the field name in sendToVMG() below if it's null in practice.
  *
  * REQUIRED wrangler.toml:
  *   [[kv_namespaces]] binding = "LEADS_SYNC_CACHE"  (mark done on success)
@@ -81,8 +100,11 @@ export default {
       let body;
       try {
         body = await request.json();
-        await processIntegrationMessage(body, env);
-        return new Response("OK", { status: 200 });
+        const externalLeadId = await processIntegrationMessage(body, env);
+        return new Response(JSON.stringify({ ok: true, externalLeadId }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
       } catch (err) {
         const { dealerKey, branchCode, dest, lead, cacheKey } = body || {};
         const label = branchCode ? `${dealerKey} [${branchCode}]` : dealerKey;
@@ -98,27 +120,38 @@ export default {
   },
 };
 
+// Routes to the right destination sender, marks the lead-destination pair
+// done in the dedup cache, and — if the destination returned an external
+// CRM lead ID — stores that too and returns it to the caller.
 async function processIntegrationMessage(msg, env) {
   const { dest, lead, intent, approvalChance, cacheKey } = msg;
+  let result;
 
   switch (dest.type) {
     case "hubspot":
-      await sendToHubSpot(lead, intent, approvalChance, dest);
+      result = await sendToHubSpot(lead, intent, approvalChance, dest);
       break;
     case "cms":
-      await sendToCMS(lead, intent, approvalChance, dest);
+      result = await sendToCMS(lead, intent, approvalChance, dest);
       break;
     case "vmg":
-      await sendToVMG(lead, intent, approvalChance, dest, env);
+      result = await sendToVMG(lead, intent, approvalChance, dest, env);
       break;
     case "dealeros":
-      await sendToDealerOS(lead, intent, approvalChance, dest);
+      result = await sendToDealerOS(lead, intent, approvalChance, dest);
       break;
     default:
       throw new Error(`Unknown destination type: ${dest.type} — this Worker only handles hubspot/cms/vmg/dealeros. Email digest lives in digest-worker.`);
   }
 
   await env.LEADS_SYNC_CACHE.put(cacheKey, "1", { expirationTtl: DONE_MARKER_TTL });
+
+  const externalLeadId = result?.externalLeadId ?? null;
+  if (externalLeadId) {
+    await env.LEADS_SYNC_CACHE.put(`${cacheKey}-external-id`, String(externalLeadId), { expirationTtl: DONE_MARKER_TTL });
+  }
+
+  return externalLeadId;
 }
 
 // ─── Approval chance → CMS credit grading ──────────────────────────────────────
@@ -158,8 +191,9 @@ async function sendToHubSpot(lead, intent, approvalChance, dest) {
   });
   const searchData = await searchRes.json();
   if (searchData.total > 0) {
-    console.log(`  ⏭️  [hubspot] Contact already exists (mobile: ${lead.mobileNumber}), skipping.`);
-    return null;
+    const existingId = searchData.results?.[0]?.id ?? null;
+    console.log(`  ⏭️  [hubspot] Contact already exists (mobile: ${lead.mobileNumber}), skipping. Existing ID: ${existingId}`);
+    return { externalLeadId: existingId };
   }
 
   let properties = {
@@ -200,7 +234,7 @@ async function sendToHubSpot(lead, intent, approvalChance, dest) {
   }
 
   console.log(`  ✅ [hubspot] Contact created: ID ${contact.id}`);
-  return contact;
+  return { ...contact, externalLeadId: contact.id ?? null };
 }
 
 async function createHubSpotContact(hubspotToken, properties) {
@@ -320,7 +354,7 @@ async function sendToCMS(lead, intent, approvalChance, dest) {
   }
 
   console.log(`  ✅ [cms] Lead created: ref ${data.leadReference}`);
-  return data;
+  return { ...data, externalLeadId: data.leadReference ?? null };
 }
 
 // ─── VMG CRM ──────────────────────────────────────────────────────────────────
@@ -377,8 +411,12 @@ async function sendToVMG(lead, intent, approvalChance, dest, env) {
     throw new Error(`VMG lead submission failed: ${res.status} — ${err}`);
   }
 
-  console.log(`  ✅ [vmg] Lead submitted for dealer ${dest.dealerId}`);
-  return res.json().catch(() => ({}));
+  const data = await res.json().catch(() => ({}));
+  // TODO: confirm actual VMG response field name against a live success
+  // response — this is a best-effort guess (lead_id, falling back to id).
+  const externalLeadId = data?.lead_id ?? data?.id ?? null;
+  console.log(`  ✅ [vmg] Lead submitted for dealer ${dest.dealerId} — external ID: ${externalLeadId}`);
+  return { ...data, externalLeadId };
 }
 
 // ─── DealerOS ─────────────────────────────────────────────────────────────────
@@ -460,6 +498,7 @@ async function sendToDealerOS(lead, intent, approvalChance, dest) {
     throw new Error(`DealerOS lead creation failed: ${res.status} — ${JSON.stringify(data)}`);
   }
 
-  console.log(`  ✅ [dealeros] Lead created for dealership ${dest.dealershipId}`);
-  return data;
+  const externalLeadId = data?.data?.lead_id ?? null;
+  console.log(`  ✅ [dealeros] Lead created for dealership ${dest.dealershipId} — DealerOS lead_id: ${externalLeadId}`);
+  return { ...data, externalLeadId };
 }
