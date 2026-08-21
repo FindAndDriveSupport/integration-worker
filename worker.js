@@ -77,6 +77,18 @@
  * On success, DealerOS returns { status, success, data: { lead_id } } —
  * lead_id is pulled out as externalLeadId.
  *
+ * DEALEROS FAILURE DIAGNOSTICS (added 2026-08-21): repeated 404s with an
+ * empty {} body from this Worker, even using credentials confirmed working
+ * via direct Postman calls — raised the possibility that DealerOS's
+ * Cloudflare-fronted edge/WAF is treating server-to-server traffic from
+ * this Worker differently than a browser/Postman client (blocking/
+ * rerouting before the request reaches their app, returning an
+ * under-informative 404 instead of 403/503). On any non-ok response, this
+ * Worker now logs the full response header set (including cf-ray,
+ * cf-mitigated, server) and the raw response body text, to distinguish an
+ * edge-level block from an application-level 404. See
+ * logDealerOSFailureDiagnostics() below.
+ *
  * ─────────────────────────────────────────────────────────────────────────
  * VMG NOTE
  * ─────────────────────────────────────────────────────────────────────────
@@ -451,6 +463,32 @@ function buildDealerOSMessage(lead, intent) {
   return parts.join(". ");
 }
 
+// Logs the full failure context for a non-ok DealerOS response: every
+// response header (headers are the whole point here — cf-ray identifies
+// the exact edge request for DealerOS/Cloudflare support to look up,
+// cf-mitigated or server values can reveal an edge/WAF-level block rather
+// than the request reaching DealerOS's actual application), the raw body
+// text (in case it's not valid JSON, which a WAF block page often isn't),
+// and the exact request we sent (headers + payload) for side-by-side
+// comparison against a known-working Postman call.
+async function logDealerOSFailureDiagnostics(res, rawBodyText, endpoint, requestHeaders, payload) {
+  const responseHeaders = {};
+  for (const [key, value] of res.headers.entries()) {
+    responseHeaders[key] = value;
+  }
+
+  console.error(`  🔍 [dealeros] DIAGNOSTICS — non-ok response detail:`);
+  console.error(`  🔍 [dealeros] Request: POST ${endpoint}`);
+  console.error(`  🔍 [dealeros] Request headers: ${JSON.stringify(requestHeaders)}`);
+  console.error(`  🔍 [dealeros] Request payload: ${JSON.stringify(payload)}`);
+  console.error(`  🔍 [dealeros] Response status: ${res.status} ${res.statusText}`);
+  console.error(`  🔍 [dealeros] Response headers: ${JSON.stringify(responseHeaders)}`);
+  console.error(`  🔍 [dealeros] Response cf-ray: ${responseHeaders["cf-ray"] ?? "(none)"}`);
+  console.error(`  🔍 [dealeros] Response cf-mitigated: ${responseHeaders["cf-mitigated"] ?? "(none)"}`);
+  console.error(`  🔍 [dealeros] Response server: ${responseHeaders["server"] ?? "(none)"}`);
+  console.error(`  🔍 [dealeros] Raw response body: ${rawBodyText}`);
+}
+
 async function sendToDealerOS(lead, intent, approvalChance, dest) {
   const endpoint = dest.endpoint || "https://api.dealeros.click/api/lead/create";
   const uniqueId = lead.idNumber || lead.mobileNumber || "unknown";
@@ -484,18 +522,32 @@ async function sendToDealerOS(lead, intent, approvalChance, dest) {
     };
   }
 
+  const requestHeaders = {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${dest.dealerosToken}`,
+  };
+
   const res = await fetch(endpoint, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${dest.dealerosToken}`,
-    },
+    headers: requestHeaders,
     body: JSON.stringify(payload),
   });
 
-  const data = await res.json().catch(() => ({}));
+  // Read the body ONCE as text first — res.json() consumes the stream, and
+  // if the body isn't valid JSON (e.g. a WAF/edge block page, which is
+  // often HTML or plain text) a second read attempt would throw. Parsing
+  // from the captured text avoids that entirely.
+  const rawBodyText = await res.text();
+  let data = {};
+  try {
+    data = rawBodyText ? JSON.parse(rawBodyText) : {};
+  } catch {
+    data = {};
+  }
+
   if (!res.ok) {
-    throw new Error(`DealerOS lead creation failed: ${res.status} — ${JSON.stringify(data)}`);
+    await logDealerOSFailureDiagnostics(res, rawBodyText, endpoint, requestHeaders, payload);
+    throw new Error(`DealerOS lead creation failed: ${res.status} — ${rawBodyText || "{}"}`);
   }
 
   const externalLeadId = data?.data?.lead_id ?? null;
