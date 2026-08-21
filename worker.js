@@ -108,6 +108,27 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
+    if (url.pathname === "/test-dealeros-auth" && request.method === "POST") {
+      // Manual diagnostic trigger only — never called by the normal lead
+      // delivery flow. POST body: { dealerosToken }. Calls a known
+      // authenticated GET endpoint (not lead creation) to isolate whether
+      // a 404 on /api/lead/create is an auth/environment problem or a
+      // routing problem specific to that one endpoint.
+      try {
+        const { dealerosToken } = await request.json();
+        const result = await testDealerOSAuth(dealerosToken);
+        return new Response(JSON.stringify(result), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err.message }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+    }
+
     if (url.pathname === "/deliver" && request.method === "POST") {
       let body;
       try {
@@ -479,7 +500,7 @@ async function logDealerOSFailureDiagnostics(res, rawBodyText, endpoint, request
 
   console.error(`  🔍 [dealeros] DIAGNOSTICS — non-ok response detail:`);
   console.error(`  🔍 [dealeros] Request: POST ${endpoint}`);
-  console.error(`  🔍 [dealeros] Request headers: ${JSON.stringify(requestHeaders)}`);
+  console.error(`  🔍 [dealeros] Request headers: ${JSON.stringify(requestHeaders)}`); // caller passes the REDACTED copy — see sendToDealerOS.
   console.error(`  🔍 [dealeros] Request payload: ${JSON.stringify(payload)}`);
   console.error(`  🔍 [dealeros] Response status: ${res.status} ${res.statusText}`);
   console.error(`  🔍 [dealeros] Response headers: ${JSON.stringify(responseHeaders)}`);
@@ -487,6 +508,41 @@ async function logDealerOSFailureDiagnostics(res, rawBodyText, endpoint, request
   console.error(`  🔍 [dealeros] Response cf-mitigated: ${responseHeaders["cf-mitigated"] ?? "(none)"}`);
   console.error(`  🔍 [dealeros] Response server: ${responseHeaders["server"] ?? "(none)"}`);
   console.error(`  🔍 [dealeros] Raw response body: ${rawBodyText}`);
+}
+
+// ─── DealerOS diagnostic: auth/environment isolation test ─────────────────────
+// Calls a known-authenticated, non-mutating DealerOS endpoint (does NOT
+// create a lead) with the same Bearer token used for lead creation. Used to
+// distinguish "token/environment isn't valid here at all" (401/302/404 on
+// THIS endpoint too) from "token+environment are fine, but /api/lead/create
+// specifically doesn't route" (200 here, 404 there). Manual trigger only —
+// see /test-dealeros-auth in the fetch handler above. Token is redacted in
+// all logging (only first 8 chars + "...REDACTED"), never logged in full.
+async function testDealerOSAuth(dealerosToken) {
+  const endpoint = "https://api.dealeros.co.za/api/profile/linked-dealerships";
+  const redactedToken = dealerosToken ? `${dealerosToken.slice(0, 8)}...REDACTED` : "(missing)";
+
+  const res = await fetch(endpoint, {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${dealerosToken}`,
+      Accept: "application/json",
+    },
+  });
+
+  const body = await res.text();
+  const headers = {};
+  for (const [key, value] of res.headers.entries()) {
+    headers[key] = value;
+  }
+
+  console.log(`🔵 [dealeros-auth-test] URL: ${endpoint}`);
+  console.log(`🔵 [dealeros-auth-test] Token: ${redactedToken}`);
+  console.log(`🔵 [dealeros-auth-test] Status: ${res.status} ${res.statusText}`);
+  console.log(`🔵 [dealeros-auth-test] Headers: ${JSON.stringify(headers)}`);
+  console.log(`🔵 [dealeros-auth-test] Body: ${body}`);
+
+  return { status: res.status, statusText: res.statusText, headers, body };
 }
 
 async function sendToDealerOS(lead, intent, approvalChance, dest) {
@@ -524,8 +580,14 @@ async function sendToDealerOS(lead, intent, approvalChance, dest) {
 
   const requestHeaders = {
     "Content-Type": "application/json",
+    Accept: "application/json",
     Authorization: `Bearer ${dest.dealerosToken}`,
   };
+
+  // Redacted copy used ONLY for logging — never log requestHeaders itself,
+  // since it carries the live bearer token.
+  const redactedToken = dest.dealerosToken ? `${dest.dealerosToken.slice(0, 8)}...REDACTED` : "(missing)";
+  const requestHeadersForLog = { ...requestHeaders, Authorization: `Bearer ${redactedToken}` };
 
   const res = await fetch(endpoint, {
     method: "POST",
@@ -546,7 +608,7 @@ async function sendToDealerOS(lead, intent, approvalChance, dest) {
   }
 
   if (!res.ok) {
-    await logDealerOSFailureDiagnostics(res, rawBodyText, endpoint, requestHeaders, payload);
+    await logDealerOSFailureDiagnostics(res, rawBodyText, endpoint, requestHeadersForLog, payload);
     throw new Error(`DealerOS lead creation failed: ${res.status} — ${rawBodyText || "{}"}`);
   }
 
