@@ -108,6 +108,52 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
+    if (url.pathname === "/test-dealeros-minimal-lead" && request.method === "POST") {
+      // Manual diagnostic trigger only — sends the smallest possible valid
+      // lead payload (no vehicle_specifications, no external_reference, no
+      // ID number) to isolate whether ANY payload shape succeeds against
+      // /api/lead/create from this Worker, or whether the route itself
+      // 404s regardless of payload content.
+      try {
+        const { dealerosToken, dealershipId } = await request.json();
+        const endpoint = "https://api.dealeros.co.za/api/lead/create";
+        const payload = {
+          customer: { first_name: "FindDrive", last_name: "Test", cell_number: "+27720000000" },
+          lead: {
+            source: "DEALER_WEBSITE_ORGANIC",
+            enquiry_method: "WEBSITE",
+            message: "FindDrive API connectivity test",
+            dealership_id: dealershipId || "2",
+          },
+        };
+        const res = await fetch(endpoint, {
+          method: "POST",
+          redirect: "manual",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "application/json",
+            Authorization: `Bearer ${dealerosToken}`,
+          },
+          body: JSON.stringify(payload),
+        });
+        const body = await res.text();
+        const headers = {};
+        for (const [key, value] of res.headers.entries()) headers[key] = value;
+        console.log(`🔬 [dealeros-test] MINIMAL-LEAD status=${res.status} ${res.statusText}`);
+        console.log(`🔬 [dealeros-test] MINIMAL-LEAD location=${headers["location"] || "(none)"}`);
+        console.log(`🔬 [dealeros-test] MINIMAL-LEAD body=${body}`);
+        return new Response(JSON.stringify({ status: res.status, location: headers["location"] || null, headers, body }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err.message }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+    }
+
     if (url.pathname === "/test-dealeros-auth" && request.method === "POST") {
       // Manual diagnostic trigger only — never called by the normal lead
       // delivery flow. POST body: { dealerosToken }. Calls a known
@@ -510,20 +556,21 @@ async function logDealerOSFailureDiagnostics(res, rawBodyText, endpoint, request
   console.error(`  🔍 [dealeros] Raw response body: ${rawBodyText}`);
 }
 
-// ─── DealerOS diagnostic: auth/environment isolation test ─────────────────────
-// Calls a known-authenticated, non-mutating DealerOS endpoint (does NOT
-// create a lead) with the same Bearer token used for lead creation. Used to
+// ─── DealerOS diagnostic: auth/environment isolation tests ────────────────────
+// Both call known-authenticated, non-mutating DealerOS endpoints (neither
+// creates a lead) with the same Bearer token used for lead creation, to
 // distinguish "token/environment isn't valid here at all" (401/302/404 on
-// THIS endpoint too) from "token+environment are fine, but /api/lead/create
-// specifically doesn't route" (200 here, 404 there). Manual trigger only —
-// see /test-dealeros-auth in the fetch handler above. Token is redacted in
-// all logging (only first 8 chars + "...REDACTED"), never logged in full.
-async function testDealerOSAuth(dealerosToken) {
-  const endpoint = "https://api.dealeros.co.za/api/profile/linked-dealerships";
-  const redactedToken = dealerosToken ? `${dealerosToken.slice(0, 8)}...REDACTED` : "(missing)";
-
+// THESE endpoints too) from "token+environment are fine, but
+// /api/lead/create specifically doesn't route" (200 here, 404 there).
+// redirect: "manual" is deliberate — DealerOS's docs show authenticated
+// failures can 302 to /login; letting fetch() auto-follow that would hide
+// the redirect and just show us whatever /login itself returns. Manual
+// trigger only — see /test-dealeros-auth in the fetch handler above. Token
+// is redacted in all logging (only first 8 chars + "...REDACTED").
+async function runDealerOSDiagnosticCall(label, endpoint, dealerosToken) {
   const res = await fetch(endpoint, {
     method: "GET",
+    redirect: "manual",
     headers: {
       Authorization: `Bearer ${dealerosToken}`,
       Accept: "application/json",
@@ -536,17 +583,34 @@ async function testDealerOSAuth(dealerosToken) {
     headers[key] = value;
   }
 
-  console.log(`🔵 [dealeros-auth-test] URL: ${endpoint}`);
-  console.log(`🔵 [dealeros-auth-test] Token: ${redactedToken}`);
-  console.log(`🔵 [dealeros-auth-test] Status: ${res.status} ${res.statusText}`);
-  console.log(`🔵 [dealeros-auth-test] Headers: ${JSON.stringify(headers)}`);
-  console.log(`🔵 [dealeros-auth-test] Body: ${body}`);
+  console.log(`🔬 [dealeros-test] ${label} status=${res.status} ${res.statusText}`);
+  console.log(`🔬 [dealeros-test] ${label} location=${headers["location"] || "(none)"}`);
+  console.log(`🔬 [dealeros-test] ${label} headers=${JSON.stringify(headers)}`);
+  console.log(`🔬 [dealeros-test] ${label} body=${body}`);
 
-  return { status: res.status, statusText: res.statusText, headers, body };
+  return { status: res.status, location: headers["location"] || null, headers, body };
+}
+
+async function testDealerOSAuth(dealerosToken) {
+  const redactedToken = dealerosToken ? `${dealerosToken.slice(0, 8)}...REDACTED` : "(missing)";
+  console.log(`🔬 [dealeros-test] Token: ${redactedToken}`);
+
+  const profile = await runDealerOSDiagnosticCall(
+    "PROFILE",
+    "https://api.dealeros.co.za/api/profile/linked-dealerships",
+    dealerosToken
+  );
+  const listings = await runDealerOSDiagnosticCall(
+    "LISTINGS",
+    "https://api.dealeros.co.za/api/listings/list",
+    dealerosToken
+  );
+
+  return { profile, listings };
 }
 
 async function sendToDealerOS(lead, intent, approvalChance, dest) {
-  const endpoint = dest.endpoint || "https://api.dealeros.co.za/api/lead/create";
+  const endpoint = dest.endpoint || "https://api.dealeros.click/api/lead/create";
   const uniqueId = lead.idNumber || lead.mobileNumber || "unknown";
 
   const payload = {
