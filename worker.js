@@ -63,6 +63,30 @@
  *   can be looked up later without digging through logs.
  *
  * ─────────────────────────────────────────────────────────────────────────
+ * CALL CONTRACT — POST /update-policy-number (from queue-worker, added 2026-08-29)
+ * ─────────────────────────────────────────────────────────────────────────
+ * Body: { dest, externalLeadId, policyNumber }
+ * Attaches a policy number to a CRM record that was already created by a
+ * prior /deliver call — dest and externalLeadId both come from that
+ * earlier call's response (queue-worker looks externalLeadId back up from
+ * LEADS_SYNC_CACHE, since it's not held anywhere else). This Worker does
+ * NOT touch LEADS_SYNC_CACHE at all for this route — no cacheKey is even
+ * passed in, since there's no new done/queued state to track.
+ *
+ * Only HubSpot is implemented for real right now — see
+ * updatePolicyNumber() below. CMS/VMG/DealerOS return
+ * { skipped: true, reason } rather than attempting anything, since none of
+ * their update/PATCH endpoints have been confirmed against real docs (the
+ * same category of gap already flagged for VMG's externalLeadId field
+ * above). Wire each one up once its actual update API is confirmed —
+ * don't guess at an endpoint shape the way this file's comments elsewhere
+ * warn against for other unconfirmed integrations.
+ *
+ * Returns 200 with { ok: true, updated: true } (HubSpot) or
+ * { ok: true, skipped: true, reason } (unimplemented destinations) on
+ * success, non-2xx on genuine failure (e.g. HubSpot's PATCH itself erroring).
+ *
+ * ─────────────────────────────────────────────────────────────────────────
  * DEALEROS NOTES
  * ─────────────────────────────────────────────────────────────────────────
  * /api/lead/create requires vehicle_specifications.{year,make,model,new_used}
@@ -195,6 +219,26 @@ export default {
       }
     }
 
+    if (url.pathname === "/update-policy-number" && request.method === "POST") {
+      let body;
+      try {
+        body = await request.json();
+        const { dest, externalLeadId, policyNumber } = body;
+        const result = await updatePolicyNumber(dest, externalLeadId, policyNumber);
+        return new Response(JSON.stringify({ ok: true, ...result }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      } catch (err) {
+        const { dest, externalLeadId } = body || {};
+        console.error(`❌ [integration] Policy number update failed for ${dest?.type} (${externalLeadId}): ${err.message}`);
+        return new Response(JSON.stringify({ error: err.message }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+    }
+
     return new Response("integration-worker", { status: 200 });
   },
 };
@@ -231,6 +275,28 @@ async function processIntegrationMessage(msg, env) {
   }
 
   return externalLeadId;
+}
+
+// Routes a policy-number-only update to the right destination handler.
+// See file header "CALL CONTRACT — POST /update-policy-number".
+async function updatePolicyNumber(dest, externalLeadId, policyNumber) {
+  if (!externalLeadId) throw new Error("updatePolicyNumber called without an externalLeadId");
+  if (!policyNumber) throw new Error("updatePolicyNumber called without a policyNumber");
+
+  switch (dest.type) {
+    case "hubspot":
+      return await updateHubSpotPolicyNumber(dest.hubspotToken, externalLeadId, policyNumber);
+    case "cms":
+    case "vmg":
+    case "dealeros":
+      // TODO: confirm each of these against real API docs before wiring
+      // up — see file header for why this is deliberately left unimplemented
+      // rather than guessed at.
+      console.warn(`  ⚠️  [${dest.type}] policy number update not implemented — externalLeadId=${externalLeadId}, policyNumber=${policyNumber}`);
+      return { skipped: true, reason: `${dest.type} policy number update endpoint not yet confirmed/implemented` };
+    default:
+      throw new Error(`Unknown destination type for policy number update: ${dest.type}`);
+  }
 }
 
 // ─── Approval chance → CMS credit grading ──────────────────────────────────────
@@ -287,6 +353,7 @@ async function sendToHubSpot(lead, intent, approvalChance, dest) {
     seriti_dealer_code: lead.dealerCode ?? null,
     seriti_lead_date: lead.date ?? null,
     lead_intent: intent === "highIntent" ? "High Intent" : "Low Intent",
+    edith_policy_number: lead.policyNumber ?? null,
   };
 
   let contact = await createHubSpotContact(hubspotToken, properties);
@@ -327,6 +394,28 @@ async function createHubSpotContact(hubspotToken, properties) {
     return { status: createRes.status, errorCode: body.category, errors: body.errors, body };
   }
   return body;
+}
+
+// Attaches a policy number to an EXISTING HubSpot contact via PATCH.
+// Requires a custom `edith_policy_number` property to exist on the portal
+// (same property createHubSpotContact() writes to on initial creation, if
+// it happens to be known at that point) — this call does NOT self-heal a
+// missing property the way contact creation does, since dropping the one
+// field being updated would leave nothing to send. If this 400s with
+// PROPERTY_DOESNT_EXIST, create that custom property on the HubSpot portal
+// first.
+async function updateHubSpotPolicyNumber(hubspotToken, contactId, policyNumber) {
+  const res = await fetch(`https://api.hubapi.com/crm/v3/objects/contacts/${contactId}`, {
+    method: "PATCH",
+    headers: { Authorization: `Bearer ${hubspotToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ properties: { edith_policy_number: policyNumber } }),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(`HubSpot policy number update failed: ${res.status} — ${JSON.stringify(body)}`);
+  }
+  console.log(`  ✅ [hubspot] Policy number ${policyNumber} attached to contact ${contactId}`);
+  return { updated: true };
 }
 
 // ─── CMS LMS ──────────────────────────────────────────────────────────────────
@@ -413,7 +502,7 @@ async function sendToCMS(lead, intent, approvalChance, dest) {
         special: "",
         specialBannerURL: "",
         serviceHistory: "",
-        comments: `Lead intent: ${intent === "highIntent" ? "High Intent" : "Low Intent"}`,
+        comments: `Lead intent: ${intent === "highIntent" ? "High Intent" : "Low Intent"}${lead.policyNumber ? `. Policy number: ${lead.policyNumber}` : ""}`,
         vin: "",
         regno: "",
         powertrain: "",
@@ -476,7 +565,7 @@ async function sendToVMG(lead, intent, approvalChance, dest, env) {
     id_no: lead.idNumber || "",
     make: lead.vehicleMake || "None",
     model_desc: lead.vehicleModel || "None",
-    message: `Lead intent: ${intent === "highIntent" ? "High Intent" : "Low Intent"}. Credit grading: ${mapApprovalChanceToCreditGrading(lead.approvalChance)}`,
+    message: `Lead intent: ${intent === "highIntent" ? "High Intent" : "Low Intent"}. Credit grading: ${mapApprovalChanceToCreditGrading(lead.approvalChance)}${lead.policyNumber ? `. Policy number: ${lead.policyNumber}` : ""}`,
   };
 
   const res = await fetch("https://api.vmgdms.com/leads/v1/new_dealer_lead", {
@@ -518,7 +607,8 @@ function resolveVehicleYear(lead) {
 // schema (customer/lead/vehicle_specifications) — same situation as lead
 // intent and credit grading, so it's folded into lead.message (max 1000
 // chars) rather than dropped. Only appended when present, since not every
-// lead in the pipeline has an estimatedAmount from Seriti.
+// lead in the pipeline has an estimatedAmount from Seriti. Same treatment
+// for policyNumber — DealerOS has no policy-number field either.
 function buildDealerOSMessage(lead, intent) {
   const parts = [
     `Lead intent: ${intent === "highIntent" ? "High Intent" : "Low Intent"}`,
@@ -526,6 +616,9 @@ function buildDealerOSMessage(lead, intent) {
   ];
   if (lead.estimatedAmount) {
     parts.push(`Estimated approval amount: R${lead.estimatedAmount}`);
+  }
+  if (lead.policyNumber) {
+    parts.push(`Policy number: ${lead.policyNumber}`);
   }
   return parts.join(". ");
 }
