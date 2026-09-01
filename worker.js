@@ -703,7 +703,7 @@ async function testDealerOSAuth(dealerosToken) {
 }
 
 async function sendToDealerOS(lead, intent, approvalChance, dest) {
-  const endpoint = dest.endpoint || "https://api.dealeros.click/api/lead/create";
+  const endpoint = dest.endpoint || "https://api.dealeros.co.za/api/lead/create";
   const uniqueId = lead.idNumber || lead.mobileNumber || "unknown";
 
   const payload = {
