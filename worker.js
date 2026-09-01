@@ -78,7 +78,10 @@
  * { skipped: true, reason } rather than attempting anything, since none of
  * their update/PATCH endpoints have been confirmed against real docs (the
  * same category of gap already flagged for VMG's externalLeadId field
- * above). Wire each one up once its actual update API is confirmed —
+ * above). DealerOS in particular is confirmed to have NO update/note API
+ * at all — its policy number only ever gets in via buildDealerOSMessage()
+ * at lead CREATION time (see that function's comments), never via this
+ * route. Wire the others up once their actual update APIs are confirmed —
  * don't guess at an endpoint shape the way this file's comments elsewhere
  * warn against for other unconfirmed integrations.
  *
@@ -607,18 +610,28 @@ function resolveVehicleYear(lead) {
 // schema (customer/lead/vehicle_specifications) — same situation as lead
 // intent and credit grading, so it's folded into lead.message (max 1000
 // chars) rather than dropped. Only appended when present, since not every
-// lead in the pipeline has an estimatedAmount from Seriti. Same treatment
-// for policyNumber — DealerOS has no policy-number field either.
+// lead in the pipeline has an estimatedAmount from Seriti.
+//
+// POLICY NUMBER: DealerOS only has this message field available at lead
+// CREATION — there's no confirmed update/note API to touch it afterward
+// (see /update-policy-number's dealeros case, which stays a no-op for
+// exactly this reason). So this only ever matters for the rare case where
+// a policy number is already known before the lead is first synced (see
+// cron-worker's "POLICY NUMBER BACKFILL" file header) — when that
+// happens, the message is replaced entirely rather than appended to,
+// since "Lead intent / Credit grading" is no longer the useful summary
+// once the application itself is already done.
 function buildDealerOSMessage(lead, intent) {
+  if (lead.policyNumber) {
+    return `Application submitted: ${lead.policyNumber}`;
+  }
+
   const parts = [
     `Lead intent: ${intent === "highIntent" ? "High Intent" : "Low Intent"}`,
     `Credit grading: ${mapApprovalChanceToCreditGrading(lead.approvalChance)}`,
   ];
   if (lead.estimatedAmount) {
     parts.push(`Estimated approval amount: R${lead.estimatedAmount}`);
-  }
-  if (lead.policyNumber) {
-    parts.push(`Policy number: ${lead.policyNumber}`);
   }
   return parts.join(". ");
 }
@@ -703,7 +716,7 @@ async function testDealerOSAuth(dealerosToken) {
 }
 
 async function sendToDealerOS(lead, intent, approvalChance, dest) {
-  const endpoint = dest.endpoint || "https://api.dealeros.co.za/api/lead/create";
+  const endpoint = dest.endpoint || "https://api.dealeros.click/api/lead/create";
   const uniqueId = lead.idNumber || lead.mobileNumber || "unknown";
 
   const payload = {
