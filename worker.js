@@ -46,6 +46,15 @@
  *                   { type: "vmg", vmgUsername, vmgPassword, dealerId, ... } |
  *                   { type: "dealeros", dealerosToken, dealershipId,
  *                     leadSource, enquiryMethod, ... }
+ * — intent is normally "highIntent" or "lowIntent" (from the Seriti lead
+ *   feed). It can also be "policySubmitted" — sent by the D1-driven
+ *   policy-sync path for a completed application that never had a Seriti
+ *   lead at all (Seriti drops a lead from its feed entirely once it
+ *   converts to a policy). See buildIntentSummaryLine() below: this value
+ *   deliberately skips intent/credit-grading messaging everywhere and just
+ *   states "Application submitted: {policyNumber}" instead — these records
+ *   were never scored highIntent/lowIntent and shouldn't be forced into
+ *   either bucket.
  * — cacheKey is written to LEADS_SYNC_CACHE with value "1" on success, so
  *   the upstream dedup check (in queue-worker) never re-sends this same
  *   lead-destination pair again. This Worker OWNS marking success — nothing
@@ -324,6 +333,22 @@ function mapApprovalChanceToCreditGrading(approvalChance) {
   return "Unknown";
 }
 
+// ─── Intent/policy summary line ────────────────────────────────────────────────
+// Shared across CMS/VMG/HubSpot's free-text fields. A record pushed by the
+// D1-driven policy-sync path (see cron-worker/policy-sync-worker) carries
+// intent === "policySubmitted" — these never had a Seriti lead at all, so
+// they were never scored highIntent/lowIntent and should NOT be forced into
+// either bucket. For those, this returns just "Application submitted:
+// {policyNumber}" with no intent/credit-grading noise. Everything else
+// keeps the normal "Lead intent: X. Credit grading: Y" line — unchanged
+// from before this policySubmitted case existed.
+function buildIntentSummaryLine(lead, intent) {
+  if (intent === "policySubmitted") {
+    return `Application submitted: ${lead.policyNumber}`;
+  }
+  return `Lead intent: ${intent === "highIntent" ? "High Intent" : "Low Intent"}. Credit grading: ${mapApprovalChanceToCreditGrading(lead.approvalChance)}`;
+}
+
 // ─── HubSpot ──────────────────────────────────────────────────────────────────
 async function sendToHubSpot(lead, intent, approvalChance, dest) {
   const hubspotToken = dest.hubspotToken;
@@ -351,11 +376,11 @@ async function sendToHubSpot(lead, intent, approvalChance, dest) {
     email: lead.emailAddress ?? null,
     seriti_id_number: lead.idNumber ?? null,
     estimated_finance: lead.estimatedAmount ?? null,
-    kredo_predicted_approval: approvalChance ?? null,
+    kredo_predicted_approval: intent === "policySubmitted" ? null : (approvalChance ?? null),
     seriti_dealer_name: lead.dealerName ?? null,
     seriti_dealer_code: lead.dealerCode ?? null,
     seriti_lead_date: lead.date ?? null,
-    lead_intent: intent === "highIntent" ? "High Intent" : "Low Intent",
+    lead_intent: intent === "policySubmitted" ? "Application Submitted" : (intent === "highIntent" ? "High Intent" : "Low Intent"),
     edith_policy_number: lead.policyNumber ?? null,
   };
 
@@ -505,7 +530,7 @@ async function sendToCMS(lead, intent, approvalChance, dest) {
         special: "",
         specialBannerURL: "",
         serviceHistory: "",
-        comments: `Lead intent: ${intent === "highIntent" ? "High Intent" : "Low Intent"}${lead.policyNumber ? `. Policy number: ${lead.policyNumber}` : ""}`,
+        comments: `${buildIntentSummaryLine(lead, intent)}`,
         vin: "",
         regno: "",
         powertrain: "",
@@ -568,7 +593,9 @@ async function sendToVMG(lead, intent, approvalChance, dest, env) {
     id_no: lead.idNumber || "",
     make: lead.vehicleMake || "None",
     model_desc: lead.vehicleModel || "None",
-    message: `Lead intent: ${intent === "highIntent" ? "High Intent" : "Low Intent"}. Credit grading: ${mapApprovalChanceToCreditGrading(lead.approvalChance)}${lead.policyNumber ? `. Policy number: ${lead.policyNumber}` : ""}`,
+    message: intent === "policySubmitted"
+      ? buildIntentSummaryLine(lead, intent)
+      : `${buildIntentSummaryLine(lead, intent)}${lead.policyNumber ? `. Policy number: ${lead.policyNumber}` : ""}`,
   };
 
   const res = await fetch("https://api.vmgdms.com/leads/v1/new_dealer_lead", {
@@ -592,18 +619,21 @@ async function sendToVMG(lead, intent, approvalChance, dest, env) {
 
 // ─── DealerOS ─────────────────────────────────────────────────────────────────
 // year defaulting: Seriti/CMS leads carry vehicleCondition but never a
-// model year. If lead.vehicleYear is ever populated upstream, it wins.
-// Otherwise: explicit USED gets (current year - 2) as a stand-in for
-// "near-new" dealer stock. Everything else — explicit NEW, or a skipped
-// vehicle-selection page where vehicleCondition is empty/undefined —
-// defaults to the current year. This is deliberate: a skipped condition
-// is NOT the same signal as a confirmed used vehicle, so it shouldn't
-// silently inherit the used-vehicle offset.
+// model year. If lead.vehicleYear is ever populated upstream (from stock
+// data in any of our DBs), it always wins. Otherwise these are HARDCODED
+// fallback values, not a relative "current year" formula — 2024 for USED,
+// 2026 for NEW, reflecting actual current stock years as of 2026-09-04.
+// These do NOT auto-update — if it's been a while since that date, check
+// with the team whether these are still the right numbers before assuming
+// they are. Everything else — explicit NEW, or a skipped vehicle-selection
+// page where vehicleCondition is empty/undefined — defaults to the NEW
+// value, same reasoning as before: a skipped condition is NOT the same
+// signal as a confirmed used vehicle, so it shouldn't silently inherit the
+// used-vehicle default.
 function resolveVehicleYear(lead) {
   if (lead.vehicleYear) return String(lead.vehicleYear);
-  const currentYear = new Date().getFullYear();
   const isUsed = String(lead.vehicleCondition || "").trim().toUpperCase() === "USED";
-  return String(isUsed ? currentYear - 2 : currentYear);
+  return isUsed ? "2024" : "2026";
 }
 
 // DealerOS has no dedicated finance/approval-amount field anywhere in its
