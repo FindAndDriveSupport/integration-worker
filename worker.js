@@ -663,17 +663,44 @@ function resolveVehicleYear(lead) {
 // happens, the message is replaced entirely rather than appended to,
 // since "Lead intent / Credit grading" is no longer the useful summary
 // once the application itself is already done.
+// DealerOS has no dedicated finance field anywhere in its schema
+// (customer/lead/vehicle_specifications) — same situation as lead intent
+// and credit grading, so net income is folded into lead.message (max 1000
+// chars) rather than dropped. Estimated approval amount was previously
+// included in the low/high-intent message too but was deliberately
+// removed (2026-09-04) — only net income appears there now. Net income is
+// still appended across all three message variants below (low intent,
+// high intent, and the completed-application variant), whenever
+// lead.netIncome is present.
+//
+// POLICY NUMBER: DealerOS only has this message field available at lead
+// CREATION — there's no confirmed update/note API to touch it afterward
+// (see /update-policy-number's dealeros case, which stays a no-op for
+// exactly this reason). So this only ever matters for the rare case where
+// a policy number is already known before the lead is first synced (see
+// cron-worker's "POLICY NUMBER BACKFILL" file header) — when that
+// happens, the message is replaced entirely rather than appended to,
+// since "Lead intent / Credit grading" is no longer the useful summary
+// once the application itself is already done. Net income still gets
+// appended to that replaced message too, when available.
 function buildDealerOSMessage(lead, intent) {
   if (lead.policyNumber) {
-    return `Application submitted: ${lead.policyNumber}`;
+    const parts = [
+      `Application submitted: ${lead.policyNumber}`,
+      `Credit grading: ${mapApprovalChanceToCreditGrading(lead.approvalChance)}`,
+    ];
+    if (lead.netIncome) {
+      parts.push(`Net income: R${lead.netIncome}`);
+    }
+    return parts.join(". ");
   }
 
   const parts = [
     `Lead intent: ${intent === "highIntent" ? "High Intent" : "Low Intent"}`,
     `Credit grading: ${mapApprovalChanceToCreditGrading(lead.approvalChance)}`,
   ];
-  if (lead.estimatedAmount) {
-    parts.push(`Estimated approval amount: R${lead.estimatedAmount}`);
+  if (lead.netIncome) {
+    parts.push(`Net income: R${lead.netIncome}`);
   }
   return parts.join(". ");
 }
