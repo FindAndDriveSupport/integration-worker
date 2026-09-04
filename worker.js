@@ -125,6 +125,18 @@
  * edge-level block from an application-level 404. See
  * logDealerOSFailureDiagnostics() below.
  *
+ * DEALEROS ENDPOINT — .co.za is the CORRECT/intended production domain,
+ * NOT .click (2026-09-04 correction). Both domains genuinely exist and
+ * both document the same /api/lead/create route, which is what caused
+ * repeated confusion during the 2026-08-21/22 debugging session — the
+ * default was flipped between the two more than once while chasing a
+ * separate DealerOS 404/503 issue that turned out to be unrelated to
+ * which domain was used (missing Accept header, then a genuine multi-day
+ * DealerOS outage). If this ever needs revisiting, confirm directly with
+ * Richard/DealerOS which domain the current token is actually issued
+ * against — don't just flip it back to .click on a hunch, since that's
+ * exactly what happened last time.
+ *
  * ─────────────────────────────────────────────────────────────────────────
  * VMG NOTE
  * ─────────────────────────────────────────────────────────────────────────
@@ -746,7 +758,9 @@ async function testDealerOSAuth(dealerosToken) {
 }
 
 async function sendToDealerOS(lead, intent, approvalChance, dest) {
-  const endpoint = dest.endpoint || "https://api.dealeros.click/api/lead/create";
+  // See file header "DEALEROS ENDPOINT" — .co.za is the correct
+  // production domain, confirmed 2026-09-04.
+  const endpoint = dest.endpoint || "https://api.dealeros.co.za/api/lead/create";
   const uniqueId = lead.idNumber || lead.mobileNumber || "unknown";
 
   const payload = {
