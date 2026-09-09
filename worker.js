@@ -54,7 +54,10 @@
  *   deliberately skips intent/credit-grading messaging everywhere and just
  *   states "Application submitted: {policyNumber}" instead — these records
  *   were never scored highIntent/lowIntent and shouldn't be forced into
- *   either bucket.
+ *   either bucket. It can also be "incomplete application" — sent by the
+ *   finance-application widgets' drop-off beacon for an applicant who
+ *   started but never finished a full application (see
+ *   buildDealerOSMessage() below for the corresponding message variant).
  * — cacheKey is written to LEADS_SYNC_CACHE with value "1" on success, so
  *   the upstream dedup check (in queue-worker) never re-sends this same
  *   lead-destination pair again. This Worker OWNS marking success — nothing
@@ -354,6 +357,14 @@ function mapApprovalChanceToCreditGrading(approvalChance) {
 // {policyNumber}" with no intent/credit-grading noise. Everything else
 // keeps the normal "Lead intent: X. Credit grading: Y" line — unchanged
 // from before this policySubmitted case existed.
+//
+// NOTE: this does NOT yet special-case intent === "incomplete application"
+// the way buildDealerOSMessage() below does — CMS/VMG/HubSpot aren't
+// currently used as destinations for the drop-off/partial-lead flow, so
+// this hasn't mattered in practice. If any of those destinations are ever
+// added for partial leads, add the same "incomplete application" branch
+// here first — otherwise it will fall through to "Lead intent: Low Intent",
+// which is wrong for a lead that was never actually scored.
 function buildIntentSummaryLine(lead, intent) {
   if (intent === "policySubmitted") {
     return `Application submitted: ${lead.policyNumber}`;
@@ -647,30 +658,14 @@ function resolveVehicleYear(lead) {
   const isUsed = String(lead.vehicleCondition || "").trim().toUpperCase() === "USED";
   return isUsed ? "2024" : "2026";
 }
-
-// DealerOS has no dedicated finance/approval-amount field anywhere in its
-// schema (customer/lead/vehicle_specifications) — same situation as lead
-// intent and credit grading, so it's folded into lead.message (max 1000
-// chars) rather than dropped. Only appended when present, since not every
-// lead in the pipeline has an estimatedAmount from Seriti.
-//
-// POLICY NUMBER: DealerOS only has this message field available at lead
-// CREATION — there's no confirmed update/note API to touch it afterward
-// (see /update-policy-number's dealeros case, which stays a no-op for
-// exactly this reason). So this only ever matters for the rare case where
-// a policy number is already known before the lead is first synced (see
-// cron-worker's "POLICY NUMBER BACKFILL" file header) — when that
-// happens, the message is replaced entirely rather than appended to,
-// since "Lead intent / Credit grading" is no longer the useful summary
-// once the application itself is already done.
 // DealerOS has no dedicated finance field anywhere in its schema
 // (customer/lead/vehicle_specifications) — same situation as lead intent
 // and credit grading, so net income is folded into lead.message (max 1000
 // chars) rather than dropped. Estimated approval amount was previously
 // included in the low/high-intent message too but was deliberately
 // removed (2026-09-04) — only net income appears there now. Net income is
-// still appended across all three message variants below (low intent,
-// high intent, and the completed-application variant), whenever
+// still appended across all message variants below (low/high intent,
+// completed application, and incomplete application), whenever
 // lead.netIncome is present.
 //
 // POLICY NUMBER: DealerOS only has this message field available at lead
@@ -683,6 +678,14 @@ function resolveVehicleYear(lead) {
 // since "Lead intent / Credit grading" is no longer the useful summary
 // once the application itself is already done. Net income still gets
 // appended to that replaced message too, when available.
+//
+// INCOMPLETE APPLICATION: intent === "incomplete application" is sent by
+// the finance-application widgets' drop-off beacon when an applicant
+// provided enough info (name, surname, ID, mobile, vehicle) to be a real
+// lead but closed the tab before submitting a full application. Handled
+// as its own branch here — without it, this would silently fall through
+// to the generic "Lead intent: Low Intent" wording below, which is wrong:
+// the applicant was never actually scored, they just didn't finish.
 function buildDealerOSMessage(lead, intent) {
   if (lead.policyNumber) {
     const parts = [
@@ -693,6 +696,14 @@ function buildDealerOSMessage(lead, intent) {
       parts.push(`Net income: R${lead.netIncome}`);
     }
     return parts.join(". ");
+  }
+
+  if (intent === "incomplete application") {
+    const parts = ["Application started but not completed — vehicle interest captured, worth a follow-up call."];
+    if (lead.netIncome) {
+      parts.push(`Net income: R${lead.netIncome}`);
+    }
+    return parts.join(" ");
   }
 
   const parts = [
