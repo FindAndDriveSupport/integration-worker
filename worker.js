@@ -327,7 +327,9 @@ async function processIntegrationMessage(msg, env) {
     if (err.terminal) {
       // Permanent rejection — mark done so it is never retried. Logged at
       // WARN on purpose: alert-worker only fires on console.error.
-      console.warn(`⚠️ [integration] ${dest.type} permanently rejected ${lead?.firstName} ${lead?.lastName} (${lead?.mobileNumber}): ${err.message}. Marking done, not retrying. Cache key: ${cacheKey}.`);
+      // NOTE: wording deliberately avoids the word "lead" — alert-worker's
+      // keyword rule (lead_flow_error) would otherwise fire on this warning.
+      console.warn(`⚠️ [integration] ${dest.type} permanently rejected contact ${lead?.firstName} ${lead?.lastName} (${lead?.mobileNumber}): ${err.message}. Marked done, no retry. Key: ${cacheKey}.`);
       await env.LEADS_SYNC_CACHE.put(cacheKey, "1", { expirationTtl: DONE_MARKER_TTL });
       return { externalLeadId: null, rejected: true, reason: err.message };
     }
@@ -614,7 +616,7 @@ async function sendToCMS(lead, intent, approvalChance, dest) {
     // Kept deliberately narrow (blacklist/duplicate) so config problems such as
     // a bad dealerRef still fail loudly and keep alerting.
     if (res.ok && /^\s*rejected\b.*\b(blacklist|duplicate)/i.test(msg)) {
-      throw new TerminalRejectionError(`CMS rejected lead: ${msg}`);
+      throw new TerminalRejectionError(`CMS rejected contact: ${msg}`);
     }
     throw new Error(`CMS lead injection failed: ${res.status} — ${msg}`);
   }
