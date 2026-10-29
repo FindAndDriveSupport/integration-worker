@@ -65,7 +65,9 @@
  *   succeeded. Returns 200 on success, non-2xx on failure (caller does not
  *   retry automatically — see note above).
  *
- * — Response body on success: { ok: true, externalLeadId }, where
+ * — Response body on success: { ok: true, externalLeadId, rejected, reason }
+ *   (rejected is true only for a terminal rejection — see "TERMINAL
+ *   REJECTIONS" below; reason is then the destination's message), where
  *   externalLeadId is the CRM-assigned ID for the created contact/lead
  *   (HubSpot contact id, CMS leadReference, DealerOS lead_id, VMG's
  *   equivalent — null if the destination didn't return one, or for "email"
@@ -73,6 +75,20 @@
  * — externalLeadId is also stored in LEADS_SYNC_CACHE under
  *   `${cacheKey}-external-id` (7-day TTL, same as the done marker) so it
  *   can be looked up later without digging through logs.
+ *
+ * ─────────────────────────────────────────────────────────────────────────
+ * TERMINAL REJECTIONS (added 2026-10-29)
+ * ─────────────────────────────────────────────────────────────────────────
+ * CMS answers HTTP 200 with a body like "Rejected - Contact Details
+ * Blacklisted" for leads it will never accept. That used to be thrown as a
+ * normal error → 500 → queue-worker "failed" → cron-worker retried the lead
+ * every 5 minutes forever, firing alert-worker each time. sendToCMS() now
+ * throws TerminalRejectionError for rejections matching blacklist/duplicate.
+ * processIntegrationMessage() catches it, writes the "1" done marker (so
+ * queue-worker reports "skipped-done" from then on), logs at WARN (alert-
+ * worker only fires on console.error), and returns 200 with
+ * { ok: true, externalLeadId: null, rejected: true, reason }. No external-id
+ * is stored, so the policy-number backfill skips rejected leads.
  *
  * ─────────────────────────────────────────────────────────────────────────
  * CALL CONTRACT — POST /update-policy-number (from queue-worker, added 2026-08-29)
@@ -155,6 +171,19 @@
 
 const DONE_MARKER_TTL = 604800; // 7 days — matches the dedup cache's existing TTL scheme.
 
+// Thrown by a destination sender when the destination PERMANENTLY refuses a
+// lead while still answering successfully at the HTTP level (e.g. CMS replies
+// 200 "Rejected - Contact Details Blacklisted"). Retrying can never succeed,
+// so processIntegrationMessage() marks the lead-destination pair done and
+// returns { rejected: true } instead of failing — see "TERMINAL REJECTIONS"
+// in the file header.
+class TerminalRejectionError extends Error {
+  constructor(message) {
+    super(message);
+    this.terminal = true;
+  }
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -230,8 +259,8 @@ export default {
       let body;
       try {
         body = await request.json();
-        const externalLeadId = await processIntegrationMessage(body, env);
-        return new Response(JSON.stringify({ ok: true, externalLeadId }), {
+        const { externalLeadId, rejected, reason } = await processIntegrationMessage(body, env);
+        return new Response(JSON.stringify({ ok: true, externalLeadId, rejected, reason }), {
           status: 200,
           headers: { "Content-Type": "application/json" },
         });
@@ -277,21 +306,32 @@ async function processIntegrationMessage(msg, env) {
   const { dest, lead, intent, approvalChance, cacheKey } = msg;
   let result;
 
-  switch (dest.type) {
-    case "hubspot":
-      result = await sendToHubSpot(lead, intent, approvalChance, dest);
-      break;
-    case "cms":
-      result = await sendToCMS(lead, intent, approvalChance, dest);
-      break;
-    case "vmg":
-      result = await sendToVMG(lead, intent, approvalChance, dest, env);
-      break;
-    case "dealeros":
-      result = await sendToDealerOS(lead, intent, approvalChance, dest);
-      break;
-    default:
-      throw new Error(`Unknown destination type: ${dest.type} — this Worker only handles hubspot/cms/vmg/dealeros. Email digest lives in digest-worker.`);
+  try {
+    switch (dest.type) {
+      case "hubspot":
+        result = await sendToHubSpot(lead, intent, approvalChance, dest);
+        break;
+      case "cms":
+        result = await sendToCMS(lead, intent, approvalChance, dest);
+        break;
+      case "vmg":
+        result = await sendToVMG(lead, intent, approvalChance, dest, env);
+        break;
+      case "dealeros":
+        result = await sendToDealerOS(lead, intent, approvalChance, dest);
+        break;
+      default:
+        throw new Error(`Unknown destination type: ${dest.type} — this Worker only handles hubspot/cms/vmg/dealeros. Email digest lives in digest-worker.`);
+    }
+  } catch (err) {
+    if (err.terminal) {
+      // Permanent rejection — mark done so it is never retried. Logged at
+      // WARN on purpose: alert-worker only fires on console.error.
+      console.warn(`⚠️ [integration] ${dest.type} permanently rejected ${lead?.firstName} ${lead?.lastName} (${lead?.mobileNumber}): ${err.message}. Marking done, not retrying. Cache key: ${cacheKey}.`);
+      await env.LEADS_SYNC_CACHE.put(cacheKey, "1", { expirationTtl: DONE_MARKER_TTL });
+      return { externalLeadId: null, rejected: true, reason: err.message };
+    }
+    throw err;
   }
 
   await env.LEADS_SYNC_CACHE.put(cacheKey, "1", { expirationTtl: DONE_MARKER_TTL });
@@ -301,7 +341,7 @@ async function processIntegrationMessage(msg, env) {
     await env.LEADS_SYNC_CACHE.put(`${cacheKey}-external-id`, String(externalLeadId), { expirationTtl: DONE_MARKER_TTL });
   }
 
-  return externalLeadId;
+  return { externalLeadId, rejected: false, reason: null };
 }
 
 // Routes a policy-number-only update to the right destination handler.
@@ -569,7 +609,14 @@ async function sendToCMS(lead, intent, approvalChance, dest) {
 
   const data = await res.json().catch(() => ({}));
   if (!res.ok || data.code !== "00") {
-    throw new Error(`CMS lead injection failed: ${res.status} — ${data.message || JSON.stringify(data)}`);
+    const msg = data.message || JSON.stringify(data);
+    // CMS answers HTTP 200 with "Rejected - ..." for leads it will never accept.
+    // Kept deliberately narrow (blacklist/duplicate) so config problems such as
+    // a bad dealerRef still fail loudly and keep alerting.
+    if (res.ok && /^\s*rejected\b.*\b(blacklist|duplicate)/i.test(msg)) {
+      throw new TerminalRejectionError(`CMS rejected lead: ${msg}`);
+    }
+    throw new Error(`CMS lead injection failed: ${res.status} — ${msg}`);
   }
 
   console.log(`  ✅ [cms] Lead created: ref ${data.leadReference}`);
